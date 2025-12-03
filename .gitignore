@@ -4,4 +4,6 @@ __pycache__/
 .env
 uploads/
 outputs/
+uploads/*
+outputs/*
 
