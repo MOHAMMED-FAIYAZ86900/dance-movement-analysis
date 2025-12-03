@@ -6,4 +6,12 @@ uploads/
 outputs/
 uploads/*
 outputs/*
+*.mp4
+uploads/
+outputs/
+# Ignore video files
+*.mp4
 
+# Ignore generated folders
+uploads/
+outputs/
