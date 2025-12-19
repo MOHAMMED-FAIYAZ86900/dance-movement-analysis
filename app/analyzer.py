@@ -1,81 +1,140 @@
 import cv2
-import mediapipe as mp
 import os
+import uuid
+import numpy as np
 
-# Initialize MediaPipe pose utilities
+import mediapipe as mp
+from ultralytics import YOLO
+
+
+# -----------------------------
+# INITIALIZE MODELS (ONCE)
+# -----------------------------
+
+# YOLOv8 for person detection
+yolo = YOLO("yolov8n.pt")  # lightweight + fast
+
+# MediaPipe Pose (single-person, high accuracy)
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 
+pose = mp_pose.Pose(
+    static_image_mode=False,
+    model_complexity=2,
+    smooth_landmarks=True,
+    min_detection_confidence=0.6,
+    min_tracking_confidence=0.6
+)
 
-def analyze_video(input_video_path: str, output_video_path: str) -> str:
+
+# -----------------------------
+# HELPER: SMOOTH LANDMARKS
+# -----------------------------
+
+def smooth_landmarks(prev, curr, alpha=0.7):
+    """Exponential moving average smoothing"""
+    if prev is None:
+        return curr
+    return alpha * prev + (1 - alpha) * curr
+
+
+# -----------------------------
+# MAIN ANALYSIS FUNCTION
+# -----------------------------
+
+def analyze_video(input_video_path: str) -> str:
     """
-    Reads a video, detects human pose, draws skeleton, and saves output video.
+    Analyze a dance video and return path to skeleton-overlay video
     """
 
-    # 1) Check if input video exists
-    if not os.path.exists(input_video_path):
-        raise FileNotFoundError(f"Input video not found: {input_video_path}")
-
-    # 2) Open input video
     cap = cv2.VideoCapture(input_video_path)
-    if not cap.isOpened():
-        raise ValueError("Failed to open input video")
 
-    # 3) Get video properties (fps, width, height)
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    if not cap.isOpened():
+        raise RuntimeError("Could not open video")
+
+    # Video properties
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
 
-    # 4) Prepare output video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(
-        output_video_path,
-        fourcc,
-        fps,
-        (width, height)
-    )
+    # Output file
+    output_name = f"skeleton_{uuid.uuid4().hex}.mp4"
+    output_path = os.path.join("outputs", output_name)
 
-    # 5) Initialize Pose model
-    with mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        enable_segmentation=False,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
-    ) as pose:
+    os.makedirs("outputs", exist_ok=True)
 
-        # 6) Read video frame by frame
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break  # No more frames
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-            # OpenCV uses BGR, MediaPipe expects RGB
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    # Store previous landmarks per person index
+    prev_landmarks = {}
 
-            # 7) Detect pose
-            results = pose.process(rgb_frame)
+    # -----------------------------
+    # PROCESS FRAMES
+    # -----------------------------
 
-            # 8) If any person is detected, draw skeleton on the frame
-            if results.pose_landmarks:
-                mp_drawing.draw_landmarks(
-                    frame,                       # draw ON this frame
-                    results.pose_landmarks,      # pose keypoints
-                    mp_pose.POSE_CONNECTIONS     # how keypoints connect (skeleton)
-                )
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-            # 9) Save the processed frame to output video
-            out.write(frame)
+        # Resize for consistency
+        frame = cv2.resize(frame, (width, height))
 
-    # 10) Release video resources
+        # Detect people using YOLO
+        results = yolo(frame, verbose=False)
+
+        person_boxes = []
+
+        for r in results:
+            for box in r.boxes:
+                cls = int(box.cls[0])
+                if cls == 0:  # class 0 = person
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    person_boxes.append((x1, y1, x2, y2))
+
+        # Process each detected person
+        for idx, (x1, y1, x2, y2) in enumerate(person_boxes):
+
+            # Safety clamp
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+
+            person_crop = frame[y1:y2, x1:x2]
+            if person_crop.size == 0:
+                continue
+
+            rgb_crop = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
+            pose_result = pose.process(rgb_crop)
+
+            if not pose_result.pose_landmarks:
+                continue
+
+            # Extract landmarks
+            landmarks = []
+            for lm in pose_result.pose_landmarks.landmark:
+                px = int(lm.x * (x2 - x1)) + x1
+                py = int(lm.y * (y2 - y1)) + y1
+                landmarks.append([px, py])
+
+            landmarks = np.array(landmarks)
+
+            # Smooth landmarks
+            smoothed = smooth_landmarks(prev_landmarks.get(idx), landmarks)
+            prev_landmarks[idx] = smoothed
+
+            # Draw skeleton
+            for connection in mp_pose.POSE_CONNECTIONS:
+                start = smoothed[connection[0]]
+                end = smoothed[connection[1]]
+                cv2.line(frame, tuple(start), tuple(end), (0, 255, 0), 2)
+
+            for (x, y) in smoothed:
+                cv2.circle(frame, (int(x), int(y)), 3, (0, 0, 255), -1)
+
+        out.write(frame)
+
     cap.release()
     out.release()
 
-    return output_video_path
-
-# if __name__ == "__main__":
-#     input_video = "sample_dance.mp4"         # must exist in project root
-#     output_video = "output_skeleton.mp4"     # will be created
-
-#     analyze_video(input_video, output_video)
-#     print("✅ Skeleton video generated:", output_video)
+    return output_path
